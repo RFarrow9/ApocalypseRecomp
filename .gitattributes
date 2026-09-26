@@ -1,0 +1,3 @@
+# Patches must stay byte-exact for git apply; shell scripts must run under sh.
+*.patch -text
+*.sh text eol=lf

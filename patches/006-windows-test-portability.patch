@@ -1,0 +1,38 @@
+diff --git a/ps1Test/CMakeLists.txt b/ps1Test/CMakeLists.txt
+index e4a5638..e962e48 100644
+--- a/ps1Test/CMakeLists.txt
++++ b/ps1Test/CMakeLists.txt
+@@ -88,6 +88,7 @@ add_executable(ps1Runtime_tests
+     runtime/test_dma.cpp
+     runtime/test_input.cpp
+     runtime/test_mdec.cpp
++    runtime/test_card_fs.cpp
+     runtime/test_timers.cpp
+     runtime/test_save_state.cpp
+     runtime/test_config.cpp
+@@ -121,6 +122,11 @@ target_link_libraries(ps1Runtime_tests
+         GTest::gtest_main
+         fmt::fmt
+ )
++if(MSVC)
++    # Fixtures hold a whole ps1::Memory (2 MB of RAM) on the stack; Linux's
++    # 8 MB default fits it, Windows' 1 MB does not.
++    target_link_options(ps1Runtime_tests PRIVATE /STACK:67108864)
++endif()
+ 
+ gtest_discover_tests(ps1Runtime_tests)
+ 
+diff --git a/ps1Test/runtime/test_config.cpp b/ps1Test/runtime/test_config.cpp
+index 0ee6041..ddd2fb4 100644
+--- a/ps1Test/runtime/test_config.cpp
++++ b/ps1Test/runtime/test_config.cpp
+@@ -11,7 +11,8 @@ protected:
+   std::string tmpPath;
+ 
+   void SetUp() override {
+-    tmpPath = std::filesystem::temp_directory_path() / "ps1_test_config.toml";
++    tmpPath = (std::filesystem::temp_directory_path() / "ps1_test_config.toml")
++                  .string(); // path is wide on Windows
+   }
+   void TearDown() override { std::remove(tmpPath.c_str()); }
+ };

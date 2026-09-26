@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# GAME DATA - NEVER COMMIT. Git history is permanent; a later delete does not
+# remove it, and a takedown request will find it. Keep disc images OUTSIDE this
+# directory entirely so `git add -A` cannot catch them.
+# ---------------------------------------------------------------------------
+*.bin
+*.cue
+*.iso
+*.img
+*.exe
+*.EXE
+# PS1 boot executables are named after the disc serial (SLES_004.60 etc.)
+SLES_*
+SLUS_*
+SCES_*
+SCUS_*
+SLPS_*
+SCPS_*
+*.mcd
+*.ppm
+# Release packages, audio dumps and screenshots are made from the game
+*.zip
+*.wav
+*.png
+memcards/
+settings.ini
+cache/
+game/
+gamedata/
+disc/
+
+# Recompiled output is a DERIVATIVE WORK of the game binary - do not publish it.
+# We ship the recipe (config + patches), the user runs it against their own copy.
+recompiled_out.cpp
+recompiled_out.*
+out/
+# Generated per machine by scripts/rebuild.sh (holds local disc paths)
+config/game_config.toml
+config/analyzer.toml
+
+# Build artefacts / upstream / toolchain
+build/
+third_party/
+cmake*/
+*.o
+*.a
+*.log
+
+# Python bytecode
+__pycache__/
+*.pyc

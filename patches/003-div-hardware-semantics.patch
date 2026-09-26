@@ -1,0 +1,77 @@
+diff --git a/ps1Recomp/src/instruction_emitter.cpp b/ps1Recomp/src/instruction_emitter.cpp
+index 2d8bec7..e474f6c 100644
+--- a/ps1Recomp/src/instruction_emitter.cpp
++++ b/ps1Recomp/src/instruction_emitter.cpp
+@@ -200,13 +200,9 @@ std::string InstructionEmitter::emitMulDiv(const Instruction &inst) const {
+         "ctx->lo = (int32_t)result; ctx->hi = (int32_t)(result >> 32); }}",
+         u32(rs), u32(rt));
+   case InstrId::DIV:
+-    return fmt::format(
+-        "if ({} != 0) {{ ctx->lo = {} / {}; ctx->hi = {} % {}; }}", s32(rt),
+-        s32(rs), s32(rt), s32(rs), s32(rt));
++    return fmt::format("DO_DIV(ctx, {}, {});", s32(rs), s32(rt));
+   case InstrId::DIVU:
+-    return fmt::format("if ({} != 0) {{ ctx->lo = (int32_t)({} / {}); "
+-                       "ctx->hi = (int32_t)({} % {}); }}",
+-                       u32(rt), u32(rs), u32(rt), u32(rs), u32(rt));
++    return fmt::format("DO_DIVU(ctx, {}, {});", u32(rs), u32(rt));
+   case InstrId::MFHI:
+     return assignReg(inst.rd, "ctx->hi");
+   case InstrId::MFLO:
+diff --git a/ps1Runtime/include/runtime/ps1_runtime_macros.h b/ps1Runtime/include/runtime/ps1_runtime_macros.h
+index 392c388..e630450 100644
+--- a/ps1Runtime/include/runtime/ps1_runtime_macros.h
++++ b/ps1Runtime/include/runtime/ps1_runtime_macros.h
+@@ -108,6 +108,34 @@ inline void DO_SWR(recomp_context *ctx, uint32_t rt, uint32_t addr) {
+   ctx->mem->write32(aligned, word);
+ }
+ 
++// DIV/DIVU with R3000A results for the cases C++ leaves undefined.  Division
++// by zero does not trap on hardware: LO = (n >= 0 ? -1 : 1) for DIV, all ones
++// for DIVU, and HI = n.  0x80000000 / -1 gives LO = 0x80000000, HI = 0 (on x86
++// the native idiv faults).  Out of line from the emitted code so a constant
++// zero divisor, which appears when data is decoded as code, still compiles.
++inline void DO_DIV(recomp_context *ctx, int32_t n, int32_t d) {
++  if (d == 0) {
++    ctx->lo = n >= 0 ? 0xFFFFFFFFu : 1u;
++    ctx->hi = static_cast<uint32_t>(n);
++  } else if (n == INT32_MIN && d == -1) {
++    ctx->lo = 0x80000000u;
++    ctx->hi = 0;
++  } else {
++    ctx->lo = static_cast<uint32_t>(n / d);
++    ctx->hi = static_cast<uint32_t>(n % d);
++  }
++}
++
++inline void DO_DIVU(recomp_context *ctx, uint32_t n, uint32_t d) {
++  if (d == 0) {
++    ctx->lo = 0xFFFFFFFFu;
++    ctx->hi = n;
++  } else {
++    ctx->lo = n / d;
++    ctx->hi = n % d;
++  }
++}
++
+ // GTE Register Access
+ // Used by GteEmitter for MFC2/MTC2/CFC2/CTC2
+ 
+diff --git a/ps1Test/recompiler/test_instruction_emitter.cpp b/ps1Test/recompiler/test_instruction_emitter.cpp
+index c4e03e3..e4f6e64 100644
+--- a/ps1Test/recompiler/test_instruction_emitter.cpp
++++ b/ps1Test/recompiler/test_instruction_emitter.cpp
+@@ -136,10 +136,11 @@ TEST(InstructionEmitter, MulDiv) {
+   EXPECT_NE(code.find("ctx->r2"), std::string::npos);
+   EXPECT_NE(code.find("ctx->lo"), std::string::npos);
+ 
+-  // DIV -- should check for zero
++  // DIV -- goes through DO_DIV, which applies the hardware divide-by-zero and
++  // overflow results
+   code = emitter.emitInstruction(MipsDecoder::decode(encR(0, 4, 5, 0, 0, 0x1A)),
+                                  0);
+-  EXPECT_NE(code.find("!= 0"), std::string::npos);
++  EXPECT_NE(code.find("DO_DIV(ctx,"), std::string::npos);
+ }
+ 
+ // Load/Store Tests

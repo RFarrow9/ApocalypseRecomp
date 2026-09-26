@@ -1,0 +1,359 @@
+# Hand-identified PsyQ entry points for Apocalypse (Europe) SLES-00460.
+#
+# ps1Analyzer's signature matcher finds the libcd/libgpu/libetc internals in
+# this binary but misses the public entry points the runtime HLEs, so those
+# ran as recompiled code against hardware the runtime does not model at that
+# level (CdInit timed out on every command, VSync never saw a VBlank).
+#
+# Each entry below was pinned with scripts/find_refs.py and cross-checked
+# against the stock PsyQ module layout, which this binary follows exactly:
+#   - by debug string:  CdInit "CdInit: Init failed", DrawSync "DrawSync(%d)",
+#                       LoadImage/StoreImage (checkRECT name strings),
+#                       VSync (sole caller of v_wait, "VSync: timeout")
+#   - by helper called: CdSync -> CD_sync, CdReady -> CD_ready,
+#                       CdGetSector -> CD_getsector
+#   - by vector slot:   libetc intr.c thunks indirect through the callback
+#                       table at *0x800F88E4; slot offset names the function
+#                       (+4 DMA, +8 Interrupt, +12 Reset, +16 Stop,
+#                        +20 VSyncCallbacks, +24 Restart; the table at
+#                        0x800F88C4 holds setIntr/startIntr/stopIntr/
+#                        restartIntr at +8/+12/+16/+24, the rest filled at
+#                        runtime).  VSyncCallbacks(ch, fn) at 0x80086C8C is
+#                        left recompiled: the runtime's handler for that name
+#                        takes a0 as the callback, but a0 is the channel.
+#
+# merge_overrides.py folds these into the analyzer's output; [[hle_functions]]
+# entries replace any analyzer entry at the same address.  hle = false undoes
+# a false signature match so the function is recompiled as game code.
+
+# ---------------------------------------------------------------------------
+# Runtime presentation
+# ---------------------------------------------------------------------------
+
+[runtime]
+title = "Apocalypse: Recompiled"
+name = "Apocalypse"
+
+# Boot file the player's disc must carry (checked at first run).
+[disc]
+boot = "SLES_004.60"
+
+# ---------------------------------------------------------------------------
+# False matches
+# ---------------------------------------------------------------------------
+
+# Analyzer says libcd_CdDataCallback, but the body is DMACallback(4, fn):
+# DMA channel 4 is the SPU, so this is libspu's transfer callback (it is
+# followed by OpenEvent(HwSPU, EvSpTRANS)).  CdDataCallback is DMACallback(3,
+# fn) -- the masked hash cannot tell the two apart.  HLE'd as CdDataCallback it
+# armed the runtime's async CD path and every later CdRead stalled forever.
+[[hle_functions]]
+name = "spu_transfer_callback"
+address = "0x800958D8"
+hle = false
+
+# ---------------------------------------------------------------------------
+# libcd streaming -> the runtime's native St implementation (psyq_st.cpp).
+# libcd's own StCdInterrupt (0x8009B7B8, registered by CdRead2 through the
+# 0x8009B35C wrapper the analyzer calls "PadStop") assembles frames from
+# interrupt-time DMAs and dropped sectors under emulated timing, so the ring
+# drifted out of step with StGetNext after a few frames.  All of the streaming
+# API goes native together: the native CdRead2 marks the stream active and
+# the BIOS hands each data sector to st_on_sector instead.
+# Callers: FMV player setup 0x8002F880, in-game video 0x8002F33C / 0x8002FB00.
+[[hle_functions]]
+name = "st_StSetRing"
+address = "0x80098188"
+
+[[hle_functions]]
+name = "st_StClearRing"
+address = "0x8009B388"
+
+[[hle_functions]]
+name = "st_StUnSetRing"
+address = "0x8009B3E8"
+
+[[hle_functions]]
+name = "st_StSetStream"
+address = "0x8009B558"
+
+[[hle_functions]]
+name = "st_StFreeRing"
+address = "0x8009B5E8"
+
+[[hle_functions]]
+name = "st_StGetNext"
+address = "0x8009B6D8"
+
+[[hle_functions]]
+name = "st_StSetMask"
+address = "0x8009B798"
+
+[[hle_functions]]
+name = "st_CdRead2"
+address = "0x8009B2D8"
+
+# Not a false match, but the runtime's ResetGraph is a stub that skips
+# libgpu's own bookkeeping: the real one clears the control block at
+# 0x800FD534, detects the GPU type (_reset, 0x8008ACE8) and stores the VRAM
+# size at +4/+6.  libgpu's get_cs/get_ce clamp every draw-area corner to
+# size-1, so with those left at 0 each SetDrawEnv/SetDrawArea produced
+# E3/E4 0x0FFFFF -- a one-pixel clip at (1023,1023) -- and every menu and
+# in-game frame drew nothing.  Recompiled, it runs against the emulated GPU.
+[[hle_functions]]
+name = "libgpu_ResetGraph"
+address = "0x800885E8"
+hle = false
+
+# ---------------------------------------------------------------------------
+# Regions: hand-written code the analyzer split into fragments that jump into
+# each other (found with scripts/find_tangles.py).  Each fragment start in
+# `replace` and each extra `entries` address becomes a copy of the whole
+# region entered there, so every jump inside stays a local goto.
+# ---------------------------------------------------------------------------
+
+# GTE polygon renderer.  Keeps its state in the scratchpad (s7 = 0x1F800000),
+# enters sibling fragments by plain `j`/branches (e.g. 0x80082700 from four
+# places, one of them in 0x800844C0), calls the 4-instruction OTZ helper at
+# 0x800829F0 with `bltzal`, and resumes through a continuation it stores at
+# 0x1F8001E4 (0x80083618) and later reaches with `jr`.  Split, the first
+# cross-fragment jump hit an address with no function: "unmapped call to
+# 0x80082700" as soon as a level rendered.
+[[regions]]
+start = "0x80081E68"
+end = "0x80084AC8"
+replace = ["0x80081E68", "0x800828E0", "0x80082E10", "0x80082F9C",
+           "0x80083180", "0x80083388", "0x80084260", "0x80084278",
+           "0x80084290", "0x800842A8", "0x800842C0", "0x800844C0",
+           "0x800845A4"]
+entries = ["0x800829F0", "0x80083618"]
+
+# Compiled functions the analyzer split in two (find_tangles.py over the whole
+# exe, code-to-code branches only).  Each pair branches both ways across the
+# false boundary, so the halves must be one function.
+
+# A C++ method (vtable 0x800A17F0 slot 2) whose early exit at 0x8001D9F0
+# branches to the shared epilogue at 0x8001DB38.  Split, the branch became a
+# call to a function that does not exist: "unmapped call to 0x8001DB38" in
+# the second attract-mode demo.
+[[regions]]
+start = "0x8001D9BC"
+end = "0x8001DB54"
+replace = ["0x8001D9BC", "0x8001DA40"]
+
+[[regions]]
+start = "0x8003FE18"
+end = "0x80040058"
+replace = ["0x8003FE18", "0x8003FFFC"]
+
+# 8 KB function; branches from the first 0x5A0 bytes land deep in the rest.
+[[regions]]
+start = "0x800424B4"
+end = "0x800445C8"
+replace = ["0x800424B4", "0x80042A54"]
+
+# ---------------------------------------------------------------------------
+# Instruction patches (applied by ps1Recomp before recompiling)
+# ---------------------------------------------------------------------------
+
+# FMV player (0x8002E8B8): after each frame it waits for the next one with
+#   s0 = 0x800000; while (!next_frame()) if (--s0 == 0) goto end_movie;
+# 8M iterations are seconds on an R3000A but a fraction of a frame for
+# native code, so every movie gave up after its first frame while the disc
+# was still streaming the second.  Raise the count to 0x7FFF0000; the
+# player's own end-of-stream check (frame >= last) still ends playback.
+[[patches]]
+address = "0x8002EC24"
+expect = "0x3C100080"   # lui s0,0x0080
+value = "0x3C107FFF"    # lui s0,0x7FFF
+
+# ---------------------------------------------------------------------------
+# Cheats offered by the runtime's overlay menu (F1).  Each poke is
+# "<hex addr>=<hex word>", written every VBlank while the cheat is on.
+# ---------------------------------------------------------------------------
+
+# The game's own debug unlock (pause, hold L1, Triangle Up Cross Down) sets
+# these four words; found by diffing RAM around the code entry.  The main
+# menu then offers SELECT LEVEL (every level) and AUTOTEST, and the pause
+# menu SKIP TO RESTART.
+[[cheats]]
+name = "Unlock all levels (level select, autotest, checkpoint skip)"
+pokes = ["800FF9B8=1", "800FF9BC=1", "800FF9C0=1", "800FF9D0=1"]
+
+# The player object is at *0x800FFC28 (it moves on respawn; the pointer
+# follows).  Found by correlating RAM snapshots with the HUD health bar.
+#   +0x0DA  health, percent (16-bit)
+#   +0x268..+0x280  weapon objects for weapon ids 1..7 (null until picked up);
+#           +0x264 is the default gun.  Weapon +0x28 is its ammo (32-bit).
+#   +0x044  class (vtable) pointer, 0x800A3920 for the player -- every cheat
+#           checks it, because between levels the pointer holds other objects
+# 0x8005E62C(player, id) is the game's own "give weapon" (the pickup handler
+# at 0x800206F8 calls it): it creates the weapon and its starting ammo.
+[[cheats]]
+name = "Infinite health"
+pokes = ["800FFC28>DA=64:h if 800FFC28>44=800A3920"]
+
+[[cheats]]
+name = "Infinite ammo"
+pokes = ["800FFC28>268>28=63 if 800FFC28>44=800A3920", "800FFC28>26C>28=63 if 800FFC28>44=800A3920", "800FFC28>270>28=63 if 800FFC28>44=800A3920",
+         "800FFC28>274>28=63 if 800FFC28>44=800A3920", "800FFC28>278>28=63 if 800FFC28>44=800A3920", "800FFC28>27C>28=63 if 800FFC28>44=800A3920",
+         "800FFC28>280>28=63 if 800FFC28>44=800A3920"]
+
+[[cheats]]
+name = "All weapons"
+pokes = ["call 8005E62C 800FFC28>0 1 unless 800FFC28>268 if 800FFC28>44=800A3920",
+         "call 8005E62C 800FFC28>0 2 unless 800FFC28>26C if 800FFC28>44=800A3920",
+         "call 8005E62C 800FFC28>0 3 unless 800FFC28>270 if 800FFC28>44=800A3920",
+         "call 8005E62C 800FFC28>0 4 unless 800FFC28>274 if 800FFC28>44=800A3920",
+         "call 8005E62C 800FFC28>0 5 unless 800FFC28>278 if 800FFC28>44=800A3920",
+         "call 8005E62C 800FFC28>0 6 unless 800FFC28>27C if 800FFC28>44=800A3920",
+         "call 8005E62C 800FFC28>0 7 unless 800FFC28>280 if 800FFC28>44=800A3920"]
+
+# ---------------------------------------------------------------------------
+# Skipped subsystems (runtime returns 0 for any `skip_` name)
+# ---------------------------------------------------------------------------
+
+# None at present.  To skip movies while debugging, map the FMV player
+# play_movie(index) at 0x8002E8B8 to "skip_play_movie" (it is called from
+# boot 0x80071988, the front end 0x80030E2C and cutscenes 0x80011BA0).
+
+# ---------------------------------------------------------------------------
+# Missed entry points
+# ---------------------------------------------------------------------------
+
+[[hle_functions]]
+name = "libetc_VSync"
+address = "0x80086998"
+
+[[hle_functions]]
+name = "libetc_ResetCallback"
+address = "0x80086BC8"
+
+[[hle_functions]]
+name = "libetc_InterruptCallback"
+address = "0x80086BF8"
+
+[[hle_functions]]
+name = "libetc_DMACallback"
+address = "0x80086C28"
+
+[[hle_functions]]
+name = "libetc_StopCallback"
+address = "0x80086CBC"
+
+[[hle_functions]]
+name = "libetc_RestartCallback"
+address = "0x80086CEC"
+
+[[hle_functions]]
+name = "libetc_CheckCallback"
+address = "0x80086D1C"
+
+[[hle_functions]]
+name = "libetc_GetIntrMask"
+address = "0x80086D2C"
+
+[[hle_functions]]
+name = "libetc_SetIntrMask"
+address = "0x80086D44"
+
+[[hle_functions]]
+name = "libetc_startIntr"
+address = "0x80086D5C"
+
+[[hle_functions]]
+name = "libetc_stopIntr"
+address = "0x8008714C"
+
+[[hle_functions]]
+name = "libetc_restartIntr"
+address = "0x800871EC"
+
+[[hle_functions]]
+name = "libgpu_DrawSync"
+address = "0x80088964"
+
+[[hle_functions]]
+name = "libgpu_LoadImage"
+address = "0x80088C10"
+
+# Matched by the analyzer but left recompiled because its list of runtime HLE
+# names is stale.  Recompiled, these drive DMA channel 6 (OTC) through
+# libgpu's queue and spin in its set_alarm timeout (0x8008AF74) -- the first
+# in-game frame never finished.
+[[hle_functions]]
+name = "libgpu_ClearOTag"
+address = "0x80088D88"
+
+[[hle_functions]]
+name = "libgpu_ClearOTagR"
+address = "0x80088E50"
+
+[[hle_functions]]
+name = "libgpu_StoreImage"
+address = "0x80088C70"
+
+[[hle_functions]]
+name = "libcd_CdInit"
+address = "0x800981B8"
+
+[[hle_functions]]
+name = "libcd_CdSync"
+address = "0x800983FC"
+
+[[hle_functions]]
+name = "libcd_CdReady"
+address = "0x8009841C"
+
+[[hle_functions]]
+name = "libcd_CdReadyCallback"
+address = "0x80098450"
+
+[[hle_functions]]
+name = "libcd_CdGetSector"
+address = "0x80098840"
+
+# CdControlB(com, param, result) -- CdControl then block until it completes.
+# Recompiled it goes through libcd's CD_cw/CD_sync, which wait on state that
+# libcd's own CD interrupt handler sets (the runtime answers the drive
+# itself), so it sat in VSync timeouts after every movie.  The runtime's
+# CdControl already completes synchronously.
+[[hle_functions]]
+name = "libcd_CdControl"
+address = "0x800986D4"
+
+# libpad.  The front end calls PadInitMtap(0x800ECA78, 0x800ECA9A) then
+# PadStartCom (0x800703EC), and its reader (0x80070A1C) parses those raw
+# buffers itself -- byte 1 == 0x80 means multitap, anything else a single
+# pad -- so PadInitDirect's single-pad fill is a valid answer to
+# PadInitMtap.  The reader's resync path is PadStopCom then PadStartCom
+# (0x80070C28).
+[[hle_functions]]
+name = "libetc_PadInitDirect"
+address = "0x8009EE08"
+
+[[hle_functions]]
+name = "libetc_PadStartCom"
+address = "0x8009CE38"
+
+[[hle_functions]]
+name = "libetc_PadStopCom"
+address = "0x8009CE58"
+
+# The rest of libpad the game calls.  Each one fetches libpad's internal
+# port table through *0x800FF490, which only the real PadInitMtap fills in;
+# with init HLE'd they called through null every in-game frame.
+# PadGetState(port), from the pad handler (0x80070708) and gameplay.
+[[hle_functions]]
+name = "libetc_PadGetState"
+address = "0x8009CEC4"
+
+# PadSetAct(port, buf, 2) -- vibration buffer (0x80070780).
+[[hle_functions]]
+name = "libpad_PadSetAct"
+address = "0x8009D278"
+
+# PadSetActAlign(port, table) -- DualShock motor negotiation (0x800707A4).
+[[hle_functions]]
+name = "libpad_PadSetActAlign"
+address = "0x8009D1F8"

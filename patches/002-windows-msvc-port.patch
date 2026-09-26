@@ -1,0 +1,457 @@
+diff --git a/ps1Recomp/src/main.cpp b/ps1Recomp/src/main.cpp
+index 98caac2..fae6690 100644
+--- a/ps1Recomp/src/main.cpp
++++ b/ps1Recomp/src/main.cpp
+@@ -245,7 +245,7 @@ int main(int argc, char *argv[]) {
+     result_cpp += "#include <cstdint>\n";
+     // The fatal path in recomp_dispatch prints a host stack, because the
+     // guest RA is stale whenever the call came through a direct JAL.
+-    result_cpp += "#include <execinfo.h>\n";
++    result_cpp += "#include <runtime/platform_compat.h>\n";
+     result_cpp += "#include <fmt/format.h>\n";
+     result_cpp += "#include <runtime/ps1_runtime_macros.h>\n";
+     result_cpp += "#include <runtime/cpu_context.h>\n";
+diff --git a/ps1Runtime/CMakeLists.txt b/ps1Runtime/CMakeLists.txt
+index d439eee..e84911b 100644
+--- a/ps1Runtime/CMakeLists.txt
++++ b/ps1Runtime/CMakeLists.txt
+@@ -52,6 +52,26 @@ target_link_libraries(ps1Runtime_lib
+     PUBLIC fmt::fmt
+ )
+ 
++if(MSVC)
++    # M_PI and friends; the recompiled translation unit is far past the default
++    # object section limit.
++    target_compile_definitions(ps1Runtime_lib PUBLIC _USE_MATH_DEFINES NOMINMAX)
++    target_compile_options(ps1Runtime_lib PUBLIC /bigobj /utf-8)
++endif()
++
++if(WIN32)
++    # The official SDL2 VC package puts its headers directly in include/, but
++    # the runtime includes <SDL2/SDL.h>.  Mirror them under an SDL2/ prefix.
++    get_target_property(_sdl2_inc SDL2::SDL2 INTERFACE_INCLUDE_DIRECTORIES)
++    foreach(_d IN LISTS _sdl2_inc)
++        if(EXISTS "${_d}/SDL.h")
++            file(COPY "${_d}/" DESTINATION "${CMAKE_BINARY_DIR}/sdl2_shim/SDL2")
++        endif()
++    endforeach()
++    target_include_directories(ps1Runtime_lib PUBLIC "${CMAKE_BINARY_DIR}/sdl2_shim")
++    target_link_libraries(ps1Runtime_lib PUBLIC SDL2::SDL2)
++endif()
++
+ # Recompiled output generation (manual; see CONTRIBUTING.md)
+ # Auto-generation from spinningCube is disabled when using custom game configs.
+ # To regenerate manually:
+@@ -99,3 +119,25 @@ target_link_libraries(ps1Runtime
+         OpenGL::GL
+         ps1Analyzer_lib
+ )
++
++if(MSVC)
++    # Linux gives the main thread 8 MB of stack and upstream relies on it:
++    # large host objects live on main()'s stack, and recompiled guest calls
++    # nest as real C++ calls.  Windows defaults to 1 MB for every thread;
++    # the reserve set here applies to std::thread too.
++    target_link_options(ps1Runtime PRIVATE /STACK:67108864)
++    # Keep a PDB even in Release: the stall sampler and crash stacks name
++    # func_XXXXXXXX frames through it.
++    target_compile_options(ps1Runtime PRIVATE /Zi)
++    target_link_options(ps1Runtime PRIVATE /DEBUG /OPT:REF /OPT:ICF)
++    target_link_libraries(ps1Runtime PRIVATE dbghelp)
++endif()
++
++if(WIN32)
++    if(TARGET SDL2::SDL2main)
++        target_link_libraries(ps1Runtime PRIVATE SDL2::SDL2main)
++    endif()
++    add_custom_command(TARGET ps1Runtime POST_BUILD
++        COMMAND ${CMAKE_COMMAND} -E copy_if_different
++            $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:ps1Runtime>)
++endif()
+diff --git a/ps1Runtime/include/runtime/gpu/renderer_opengl.h b/ps1Runtime/include/runtime/gpu/renderer_opengl.h
+index d79e0f4..bd4df73 100644
+--- a/ps1Runtime/include/runtime/gpu/renderer_opengl.h
++++ b/ps1Runtime/include/runtime/gpu/renderer_opengl.h
+@@ -1,7 +1,68 @@
+ #pragma once
+ 
+ #include "runtime/gpu/gpu.h"
++#ifdef _WIN32
++// Windows ships only GL 1.1 headers/exports; everything newer is loaded at
++// runtime through SDL once the context exists (see loadGLFunctions()).
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <SDL2/SDL_opengl.h>
++#define PS1_GL_FUNCS(X)                                                        \
++  X(PFNGLATTACHSHADERPROC, glAttachShader)                                     \
++  X(PFNGLBINDBUFFERPROC, glBindBuffer)                                         \
++  X(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray)                               \
++  X(PFNGLBUFFERDATAPROC, glBufferData)                                         \
++  X(PFNGLCOMPILESHADERPROC, glCompileShader)                                   \
++  X(PFNGLCREATEPROGRAMPROC, glCreateProgram)                                   \
++  X(PFNGLCREATESHADERPROC, glCreateShader)                                     \
++  X(PFNGLDELETEBUFFERSPROC, glDeleteBuffers)                                   \
++  X(PFNGLDELETEPROGRAMPROC, glDeleteProgram)                                   \
++  X(PFNGLDELETESHADERPROC, glDeleteShader)                                     \
++  X(PFNGLDELETEVERTEXARRAYSPROC, glDeleteVertexArrays)                         \
++  X(PFNGLENABLEVERTEXATTRIBARRAYPROC, glEnableVertexAttribArray)               \
++  X(PFNGLGENBUFFERSPROC, glGenBuffers)                                         \
++  X(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays)                               \
++  X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog)                           \
++  X(PFNGLGETPROGRAMIVPROC, glGetProgramiv)                                     \
++  X(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog)                             \
++  X(PFNGLGETSHADERIVPROC, glGetShaderiv)                                       \
++  X(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation)                         \
++  X(PFNGLLINKPROGRAMPROC, glLinkProgram)                                       \
++  X(PFNGLSHADERSOURCEPROC, glShaderSource)                                     \
++  X(PFNGLUNIFORM4FPROC, glUniform4f)                                           \
++  X(PFNGLUSEPROGRAMPROC, glUseProgram)                                         \
++  X(PFNGLVERTEXATTRIBPOINTERPROC, glVertexAttribPointer)
++#define PS1_GL_DECLARE(type, name) extern type ps1_##name;
++PS1_GL_FUNCS(PS1_GL_DECLARE)
++#undef PS1_GL_DECLARE
++#define glAttachShader ps1_glAttachShader
++#define glBindBuffer ps1_glBindBuffer
++#define glBindVertexArray ps1_glBindVertexArray
++#define glBufferData ps1_glBufferData
++#define glCompileShader ps1_glCompileShader
++#define glCreateProgram ps1_glCreateProgram
++#define glCreateShader ps1_glCreateShader
++#define glDeleteBuffers ps1_glDeleteBuffers
++#define glDeleteProgram ps1_glDeleteProgram
++#define glDeleteShader ps1_glDeleteShader
++#define glDeleteVertexArrays ps1_glDeleteVertexArrays
++#define glEnableVertexAttribArray ps1_glEnableVertexAttribArray
++#define glGenBuffers ps1_glGenBuffers
++#define glGenVertexArrays ps1_glGenVertexArrays
++#define glGetProgramInfoLog ps1_glGetProgramInfoLog
++#define glGetProgramiv ps1_glGetProgramiv
++#define glGetShaderInfoLog ps1_glGetShaderInfoLog
++#define glGetShaderiv ps1_glGetShaderiv
++#define glGetUniformLocation ps1_glGetUniformLocation
++#define glLinkProgram ps1_glLinkProgram
++#define glShaderSource ps1_glShaderSource
++#define glUniform4f ps1_glUniform4f
++#define glUseProgram ps1_glUseProgram
++#define glVertexAttribPointer ps1_glVertexAttribPointer
++#else
+ #include <GLES3/gl3.h> // Common desktop/mobile GL
++#endif
+ #include <SDL2/SDL.h>
+ #include <string>
+ 
+diff --git a/ps1Runtime/include/runtime/platform_compat.h b/ps1Runtime/include/runtime/platform_compat.h
+new file mode 100644
+index 0000000..30ae785
+--- /dev/null
++++ b/ps1Runtime/include/runtime/platform_compat.h
+@@ -0,0 +1,56 @@
++#pragma once
++// Host-platform shims so the runtime builds with MSVC on Windows.
++//
++// Upstream targets Linux/gcc and uses glibc's <execinfo.h> backtraces and gcc
++// builtins in its diagnostics.  On Windows these map onto the Win32/MSVC
++// equivalents; symbols are printed as raw addresses (resolve them against the
++// PDB), which is enough for the debug paths that use them.
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <intrin.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#define PS1_RETURN_ADDRESS() _ReturnAddress()
++
++inline int backtrace(void **buffer, int size) {
++  return static_cast<int>(
++      CaptureStackBackTrace(1, static_cast<DWORD>(size), buffer, nullptr));
++}
++
++// glibc contract: one malloc'd block holding the pointer array followed by the
++// strings, released by the caller with a single free().
++inline char **backtrace_symbols(void *const *buffer, int size) {
++  constexpr std::size_t kLen = 2 + 16 + 1;
++  char **out = static_cast<char **>(
++      std::malloc(size * (sizeof(char *) + kLen)));
++  if (!out)
++    return nullptr;
++  char *strings = reinterpret_cast<char *>(out + size);
++  for (int i = 0; i < size; ++i) {
++    out[i] = strings + i * kLen;
++    std::snprintf(out[i], kLen, "0x%llx",
++                  static_cast<unsigned long long>(
++                      reinterpret_cast<uintptr_t>(buffer[i])));
++  }
++  return out;
++}
++
++inline void backtrace_symbols_fd(void *const *buffer, int size, int /*fd*/) {
++  for (int i = 0; i < size; ++i)
++    std::fprintf(stderr, "0x%llx\n",
++                 static_cast<unsigned long long>(
++                     reinterpret_cast<uintptr_t>(buffer[i])));
++}
++#else
++#include <execinfo.h>
++#define PS1_RETURN_ADDRESS() __builtin_return_address(0)
++#endif
+diff --git a/ps1Runtime/src/bios/bios.cpp b/ps1Runtime/src/bios/bios.cpp
+index 1e8b768..4fd2ed6 100644
+--- a/ps1Runtime/src/bios/bios.cpp
++++ b/ps1Runtime/src/bios/bios.cpp
+@@ -10,7 +10,7 @@
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstring>
+-#include <execinfo.h>
++#include "runtime/platform_compat.h"
+ #include <fmt/format.h>
+ 
+ // Forward declare recomp_dispatch (defined in recompiled_out.cpp, global
+@@ -521,7 +521,7 @@ void Bios::drainPendingCallbacksSlow() {
+       // (resolve with: addr2line -e ps1Runtime <addr>).
+       fmt::print(stderr, "[DRAIN] enter#{} (exits={}) caller={}\n", n,
+                  exit.load(std::memory_order_relaxed),
+-                 fmt::ptr(__builtin_return_address(0)));
++                 fmt::ptr(PS1_RETURN_ADDRESS()));
+     }
+   }
+ 
+diff --git a/ps1Runtime/src/dma/dma.cpp b/ps1Runtime/src/dma/dma.cpp
+index c68fb0b..5e52759 100644
+--- a/ps1Runtime/src/dma/dma.cpp
++++ b/ps1Runtime/src/dma/dma.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/platform_compat.h"
+ #include "runtime/dma/dma.h"
+ #include <array>
+ #include "runtime/cdrom/cdrom_controller.h"
+@@ -84,7 +85,7 @@ void DMA::writeRegister(uint32_t addr, uint32_t val) {
+                        dma2TrigCount, val, channels_[ch].baseAddr,
+                        channels_[ch].blockControl,
+                        static_cast<int>(getSyncMode(ch)), isFromRam(ch),
+-                       __builtin_return_address(0));
++                       PS1_RETURN_ADDRESS());
+           }
+         }
+       }
+diff --git a/ps1Runtime/src/gpu/gpu.cpp b/ps1Runtime/src/gpu/gpu.cpp
+index 649d6fd..2e2803b 100644
+--- a/ps1Runtime/src/gpu/gpu.cpp
++++ b/ps1Runtime/src/gpu/gpu.cpp
+@@ -1,5 +1,5 @@
+ #include "runtime/gpu/gpu.h"
+-#include <execinfo.h>
++#include "runtime/platform_compat.h"
+ #include <cstdlib>
+ #include "runtime/metrics.h"
+ #include <algorithm>
+diff --git a/ps1Runtime/src/gpu/renderer_opengl.cpp b/ps1Runtime/src/gpu/renderer_opengl.cpp
+index b543ea5..a39c5ad 100644
+--- a/ps1Runtime/src/gpu/renderer_opengl.cpp
++++ b/ps1Runtime/src/gpu/renderer_opengl.cpp
+@@ -3,10 +3,31 @@
+ #include <iostream>
+ 
+ // Use desktop GL via SDL GLAD or just default GL provided by system
++#ifndef _WIN32
+ #ifndef GL_GLEXT_PROTOTYPES
+ #define GL_GLEXT_PROTOTYPES 1
+ #endif
+ #include <SDL2/SDL_opengl.h>
++#endif
++
++#ifdef _WIN32
++#define PS1_GL_DEFINE(type, name) type ps1_##name = nullptr;
++PS1_GL_FUNCS(PS1_GL_DEFINE)
++#undef PS1_GL_DEFINE
++
++static bool loadGLFunctions() {
++  bool ok = true;
++#define PS1_GL_LOAD(type, name)                                                \
++  ps1_##name = reinterpret_cast<type>(SDL_GL_GetProcAddress(#name));           \
++  if (!ps1_##name) {                                                           \
++    fmt::print(stderr, "[RendererGL] missing GL entry point {}\n", #name);     \
++    ok = false;                                                                \
++  }
++  PS1_GL_FUNCS(PS1_GL_LOAD)
++#undef PS1_GL_LOAD
++  return ok;
++}
++#endif
+ 
+ namespace ps1::gpu {
+ 
+@@ -75,6 +96,11 @@ bool RendererOpenGL::init(const std::string &windowTitle) {
+     return false;
+   }
+ 
++#ifdef _WIN32
++  if (!loadGLFunctions())
++    return false;
++#endif
++
+   SDL_GL_SetSwapInterval(1); // VSync on
+ 
+   GLuint vs = compileShader(GL_VERTEX_SHADER, VERTEX_SHADER_SRC);
+diff --git a/ps1Runtime/src/main_host.cpp b/ps1Runtime/src/main_host.cpp
+index ea693dc..f335344 100644
+--- a/ps1Runtime/src/main_host.cpp
++++ b/ps1Runtime/src/main_host.cpp
+@@ -7,10 +7,14 @@
+ #include <atomic>
+ #include <chrono>
+ #include <csignal>
+-#include <execinfo.h>
++#include "runtime/platform_compat.h"
++#ifdef _WIN32
++#include <dbghelp.h>
++#else
+ #include <sys/mman.h>
+ #include <ucontext.h>
+ #include <unistd.h>
++#endif
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -31,8 +35,9 @@
+ #include <runtime/gpu/gpu.h>
+ #include <runtime/gpu/renderer_opengl.h>
+ #include <algorithm>
+-#include <execinfo.h>
++#ifndef _WIN32
+ #include <pthread.h>
++#endif
+ #include <runtime/input/input.h>
+ #include <runtime/mdec/mdec.h>
+ #include <runtime/memory.h>
+@@ -73,6 +78,7 @@ static ps1::spu::SPU *g_spu = nullptr;
+ //                               neighbours' traffic (def. the whole span).
+ // ---------------------------------------------------------------------------
+ namespace {
++#ifndef _WIN32
+ uint8_t *g_guardBase = nullptr;
+ std::size_t g_guardLen = 0;
+ uint8_t *g_guardRamBase = nullptr;
+@@ -227,6 +233,7 @@ void guardSigsegv(int sig, siginfo_t *info, void *ctx) {
+   uc->uc_mcontext.gregs[REG_EFL] |= static_cast<greg_t>(0x100);
+   g_guardStepping = 1;
+ }
++#endif // !_WIN32
+ 
+ // Presented frames, guest VBlanks and wall time, side by side.
+ //
+@@ -254,6 +261,18 @@ void reportClocks(uint64_t renderFrames) {
+              hw / secs);
+ }
+ 
++#ifdef _WIN32
++// The write guard needs mprotect + SIGSEGV/SIGTRAP with ucontext access; on
++// Windows it is not available and PS1_WRITE_GUARD is ignored with a notice.
++uint32_t g_guardArmAt = 0;
++bool g_guardArmed = true;
++void dumpWriteGuard() {}
++void armWriteGuard() {}
++void installWriteGuard(uint8_t *) {
++  if (const char *spec = std::getenv("PS1_WRITE_GUARD"); spec && *spec)
++    fmt::print(stderr, "[WGUARD] not supported on Windows -- ignored\n");
++}
++#else
+ // Called at shutdown so a run that caught several writers still reports the
+ // full census, not only the ones whose stack fit in the shot budget.
+ void dumpWriteGuard() {
+@@ -358,6 +377,7 @@ void installWriteGuard(uint8_t *ramPtr) {
+   if (g_guardArmAt == 0)
+     armWriteGuard();
+ }
++#endif // _WIN32
+ } // namespace
+ 
+ // Forward declaration -- generated by ps1Recomp in recompiled_out.cpp
+@@ -514,6 +534,12 @@ int main(int argc, char *argv[]) {
+ 
+   std::signal(SIGTERM, onTerminate);
+   std::signal(SIGINT, onTerminate);
++#ifdef _WIN32
++  // The MSVC CRT fully buffers a redirected stdout (it has no line mode), and
++  // a run stopped from outside is terminated without flushing, so the log of
++  // exactly the run worth reading would be lost.
++  std::setvbuf(stdout, nullptr, _IONBF, 0);
++#endif
+ 
+   // Parse arguments: support --config flag anywhere
+   std::string input_path;
+@@ -1319,6 +1345,57 @@ int main(int argc, char *argv[]) {
+     gameThreadDone.store(true, std::memory_order_release);
+   });
+ 
++#ifdef _WIN32
++  // Windows stall sampler: suspend the game thread, walk its stack, resume,
++  // then symbolize from the PDB.  Symbolizing happens after the resume
++  // because DbgHelp allocates, and the suspended thread may hold the heap lock.
++  if (const char *everyMs = std::getenv("PS1_STALL_SAMPLE")) {
++    const long periodMs = std::max(200L, std::strtol(everyMs, nullptr, 10));
++    HANDLE gt = static_cast<HANDLE>(gameThread.native_handle());
++    std::thread([gt, periodMs, &gameFinished]() {
++      HANDLE proc = GetCurrentProcess();
++      SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
++      SymInitialize(proc, nullptr, TRUE);
++      while (!gameFinished.load(std::memory_order_acquire)) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(periodMs));
++        if (SuspendThread(gt) == static_cast<DWORD>(-1))
++          return;
++        CONTEXT c{};
++        c.ContextFlags = CONTEXT_FULL;
++        DWORD64 pcs[14];
++        int depth = 0;
++        if (GetThreadContext(gt, &c)) {
++          STACKFRAME64 f{};
++          f.AddrPC.Offset = c.Rip;
++          f.AddrPC.Mode = AddrModeFlat;
++          f.AddrFrame.Offset = c.Rbp;
++          f.AddrFrame.Mode = AddrModeFlat;
++          f.AddrStack.Offset = c.Rsp;
++          f.AddrStack.Mode = AddrModeFlat;
++          while (depth < 14 &&
++                 StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, gt, &f, &c,
++                             nullptr, SymFunctionTableAccess64,
++                             SymGetModuleBase64, nullptr) &&
++                 f.AddrPC.Offset != 0)
++            pcs[depth++] = f.AddrPC.Offset;
++        }
++        ResumeThread(gt);
++        fmt::print(stderr, "[stall] depth={}\n", depth);
++        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
++        auto *sym = reinterpret_cast<SYMBOL_INFO *>(buf);
++        for (int i = 0; i < depth; ++i) {
++          sym->SizeOfStruct = sizeof(SYMBOL_INFO);
++          sym->MaxNameLen = 255;
++          DWORD64 disp = 0;
++          if (SymFromAddr(proc, pcs[i], &disp, sym))
++            fmt::print(stderr, "[stall]   #{} {}+0x{:X}\n", i, sym->Name, disp);
++          else
++            fmt::print(stderr, "[stall]   #{} 0x{:X}\n", i, pcs[i]);
++        }
++      }
++    }).detach();
++  }
++#else
+   if (const char *everyMs = std::getenv("PS1_STALL_SAMPLE")) {
+     struct sigaction sa {};
+     sa.sa_handler = stallSampler;
+@@ -1345,6 +1422,7 @@ int main(int argc, char *argv[]) {
+       }
+     }).detach();
+   }
++#endif
+ 
+   bool running = true;
+   while (running) {

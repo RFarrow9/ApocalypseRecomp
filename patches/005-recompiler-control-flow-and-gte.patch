@@ -1,0 +1,449 @@
+diff --git a/ps1Recomp/include/ps1recomp/instruction_emitter.h b/ps1Recomp/include/ps1recomp/instruction_emitter.h
+index 9db0d8f..40cac2a 100644
+--- a/ps1Recomp/include/ps1recomp/instruction_emitter.h
++++ b/ps1Recomp/include/ps1recomp/instruction_emitter.h
+@@ -27,6 +27,10 @@ struct RecompFunction {
+   std::string name;
+   uint32_t address = 0;
+   uint32_t size = 0;
++  /// Where execution starts, when that is not `address`.  Hand-written code
++  /// that jumps between fragments is emitted as one region per entry point,
++  /// so every transfer inside the region stays a local goto.  0 = `address`.
++  uint32_t entry = 0;
+   std::vector<uint32_t> instructions; // Raw 32-bit words
+ 
+   /// Whether a given address within this function is a branch/jump target
+diff --git a/ps1Recomp/src/dispatch_emitter.cpp b/ps1Recomp/src/dispatch_emitter.cpp
+index 9e53c47..2e148ca 100644
+--- a/ps1Recomp/src/dispatch_emitter.cpp
++++ b/ps1Recomp/src/dispatch_emitter.cpp
+@@ -9,10 +9,19 @@ std::string emitDispatchBody() {
+ 
+     // 1. NULL pointer guard
+     if (addr == 0) [[unlikely]] {
+-        static bool nullDispatchWarned = false;
+-        if (!nullDispatchWarned) {
+-            nullDispatchWarned = true;
+-            fmt::print("[DISPATCH] null addr suppressed (startup transient, RA=0x{:08X})\n", ctx->r[31]);
++        // Every null call is reported up to a budget, with the register file:
++        // a single "startup transient" line hid repeated null calls from game
++        // objects whose method tables were never filled in.
++        static unsigned nullDispatchCount = 0;
++        if (++nullDispatchCount <= 8) {
++            fmt::print("[DISPATCH] null call #{} suppressed (RA=0x{:08X})\n",
++                       nullDispatchCount, ctx->r[31]);
++            for (int i = 0; i < 32; i += 8)
++                fmt::print("[DISPATCH]   r{:<2} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}\n",
++                           i, ctx->r[i], ctx->r[i + 1], ctx->r[i + 2], ctx->r[i + 3],
++                           ctx->r[i + 4], ctx->r[i + 5], ctx->r[i + 6], ctx->r[i + 7]);
++        } else if ((nullDispatchCount & (nullDispatchCount - 1)) == 0) {
++            fmt::print("[DISPATCH] {} null calls suppressed so far\n", nullDispatchCount);
+         }
+         return;
+     }
+@@ -89,6 +98,27 @@ std::string emitDispatchBody() {
+                    "           RA is stale on direct-JAL paths -- trust the site and the stack.\n"
+                    "           Set PS1_DISPATCH_PERMISSIVE=1 to log and continue instead.\n",
+                    addr, phys, ps1LastIndirectSite(), ctx->r[31]);
++        // Guest registers: a bad target usually came out of an object or
++        // table that one of these still points at.
++        for (int i = 0; i < 32; i += 4)
++            fmt::print(stderr, "           r{:<2}={:08X} r{:<2}={:08X} r{:<2}={:08X} r{:<2}={:08X}\n",
++                       i, ctx->r[i], i + 1, ctx->r[i + 1], i + 2, ctx->r[i + 2],
++                       i + 3, ctx->r[i + 3]);
++        // PS1_FATAL_PEEK=addr[,addr...]: 32 bytes of RAM at each address.
++        if (const char* pk = std::getenv("PS1_FATAL_PEEK")) {
++            for (const char* p = pk; *p;) {
++                char* e = nullptr;
++                uint32_t a = (uint32_t)std::strtoul(p, &e, 16) & 0x1FFFFCu;
++                if (e == p) break;
++                fmt::print(stderr, "           [{:08X}]", 0x80000000u | a);
++                for (uint32_t k = 0; k < 32; k += 4)
++                    fmt::print(stderr, " {:08X}",
++                               (uint32_t)rdram[a + k] | ((uint32_t)rdram[a + k + 1] << 8) |
++                               ((uint32_t)rdram[a + k + 2] << 16) | ((uint32_t)rdram[a + k + 3] << 24));
++                fmt::print(stderr, "\n");
++                p = (*e == ',') ? e + 1 : e;
++            }
++        }
+         std::fflush(stderr);
+         void* bt[24];
+         int frames = backtrace(bt, 24);
+diff --git a/ps1Recomp/src/instruction_emitter.cpp b/ps1Recomp/src/instruction_emitter.cpp
+index e474f6c..fd755ca 100644
+--- a/ps1Recomp/src/instruction_emitter.cpp
++++ b/ps1Recomp/src/instruction_emitter.cpp
+@@ -297,12 +297,22 @@ std::string InstructionEmitter::emitBranch(const Instruction &inst,
+     return fmt::format("if ({} < 0) goto {};", s32(rs), target);
+   case InstrId::BGEZ:
+     return fmt::format("if ({} >= 0) goto {};", s32(rs), target);
++  // BLTZAL/BGEZAL are conditional CALLS: $ra = PC+8 is written whether or not
++  // the branch is taken, and a taken branch returns to PC+8 through `jr $ra`.
++  // Emitting them as a goto made the callee's `jr $ra` return from the whole
++  // enclosing C++ function (or, for a target outside it, tail-dispatch and
++  // never come back).  Hand-written GTE code uses them for small clip/Z
++  // helpers -- Apocalypse's renderer at 0x80081E68 crashed on it.  The call
++  // goes through the dispatch table like JALR: data decoded as code yields
++  // bogus BLTZAL targets, and those must not become undeclared symbols.
+   case InstrId::BLTZAL:
+-    return fmt::format("ctx->r31 = 0x{:08X}; if ({} < 0) goto {};", pc + 8,
+-                       s32(rs), target);
++    return fmt::format("ctx->r31 = 0x{:08X}; if ({} < 0) {{ CALL_INDIRECT_AT("
++                       "ctx, 0x{:08X}u, 0x{:08X}u); }}",
++                       pc + 8, s32(rs), inst.branchTarget(pc), pc);
+   case InstrId::BGEZAL:
+-    return fmt::format("ctx->r31 = 0x{:08X}; if ({} >= 0) goto {};", pc + 8,
+-                       s32(rs), target);
++    return fmt::format("ctx->r31 = 0x{:08X}; if ({} >= 0) {{ CALL_INDIRECT_AT("
++                       "ctx, 0x{:08X}u, 0x{:08X}u); }}",
++                       pc + 8, s32(rs), inst.branchTarget(pc), pc);
+   default:
+     return fmt::format("// UNKNOWN BRANCH: {}",
+                        MipsDecoder::instrName(inst.id));
+@@ -325,7 +335,9 @@ std::string InstructionEmitter::emitJump(const Instruction &inst,
+     // stale $ra from some earlier indirect call then travels into memory and
+     // comes back as a garbage pointer. JALR below already does this; JAL did
+     // not, across every one of its call sites.
+-    return fmt::format("ctx->r31 = 0x{:08X}; {}(rdram, ctx);", pc + 8, name);
++    return fmt::format(
++        "ctx->r31 = 0x{:08X}; PS1_ABI_CALL(ctx, 0x{:08X}u, 0x{:08X}u, {}(rdram, ctx));",
++        pc + 8, target, pc, name);
+   }
+   case InstrId::JR:
+     if (inst.rs == 31) {
+@@ -359,21 +371,28 @@ std::string InstructionEmitter::emitCOP0(const Instruction &inst) const {
+ 
+ // GTE Register Move Emitter
+ 
++// Register moves go through the runtime's GTE accessors, which apply the
++// hardware read/write behaviour (LZCR from LZCS, IR/VZ sign expansion, SXYP
++// FIFO push, IRGB/ORGB, sign-expanded control reads, FLAG bit 31).  Raw
++// cop2d/cop2c access skipped all of it -- a square root built on LZCS/LZCR
++// always read LZCR as whatever was last stored there.
+ std::string InstructionEmitter::emitGTEMove(const Instruction &inst) const {
+   switch (inst.id) {
+   case InstrId::MFC2:
+-    return assignReg(inst.rt, fmt::format("ctx->cop2d[{}]", inst.rd));
++    return assignReg(inst.rt, fmt::format("gte_read_data(ctx, {})", inst.rd));
+   case InstrId::MTC2:
+-    return fmt::format("ctx->cop2d[{}] = {};", inst.rd, reg(inst.rt));
++    return fmt::format("gte_write_data(ctx, {}, {});", inst.rd, reg(inst.rt));
+   case InstrId::CFC2:
+-    return assignReg(inst.rt, fmt::format("ctx->cop2c[{}]", inst.rd));
++    return assignReg(inst.rt,
++                     fmt::format("gte_read_control(ctx, {})", inst.rd));
+   case InstrId::CTC2:
+-    return fmt::format("ctx->cop2c[{}] = {};", inst.rd, reg(inst.rt));
++    return fmt::format("gte_write_control(ctx, {}, {});", inst.rd,
++                       reg(inst.rt));
+   case InstrId::LWC2:
+-    return fmt::format("ctx->cop2d[{}] = MEM_READ32(ctx, {} + {});", inst.rt,
+-                       s32(reg(inst.rs)), inst.imm16);
++    return fmt::format("gte_write_data(ctx, {}, MEM_READ32(ctx, {} + {}));",
++                       inst.rt, s32(reg(inst.rs)), inst.imm16);
+   case InstrId::SWC2:
+-    return fmt::format("MEM_WRITE32(ctx, {} + {}, ctx->cop2d[{}]);",
++    return fmt::format("MEM_WRITE32(ctx, {} + {}, gte_read_data(ctx, {}));",
+                        s32(reg(inst.rs)), inst.imm16, inst.rt);
+   default:
+     return fmt::format("// UNKNOWN GTE MOVE: {}",
+@@ -485,6 +504,13 @@ std::string InstructionEmitter::emitFunction(const RecompFunction &func) const {
+   // Function signature
+   result += fmt::format("void {}(uint8_t* rdram, recomp_context* ctx) {{\n",
+                         func.name);
++  // The return address this call was made with.  Hand-written code that must
++  // call something itself often parks $ra in another register and returns
++  // with `jr $t6` (Apocalypse's 0x800863D0); a register jump to exactly this
++  // address is that return, not a computed jump into the caller's middle.
++  result += "    [[maybe_unused]] const uint32_t _entry_ra = ctx->r31;\n";
++  if (func.entry != 0 && func.entry != func.address)
++    result += fmt::format("    goto {}; // region entry\n", label(func.entry));
+ 
+   uint32_t pc = func.address;
+   size_t numInstr = func.instructions.size();
+@@ -554,9 +580,13 @@ std::string InstructionEmitter::emitFunction(const RecompFunction &func) const {
+   // entry -- $sp included -- is never restored.
+   auto indirectJump = [&](uint8_t rs, uint32_t site) {
+     if (raResume.empty())
+-      return fmt::format("JUMP_INDIRECT_AT(ctx, {}, 0x{:08X}u);", reg(rs), site);
++      return fmt::format("if ({} == _entry_ra) return; "
++                         "JUMP_INDIRECT_AT(ctx, {}, 0x{:08X}u);",
++                         reg(rs), reg(rs), site);
+     std::string code =
+-        fmt::format("JUMP_INDIRECT_RESUME_AT(ctx, {}, 0x{:08X}u);\n", reg(rs), site);
++        fmt::format("if ({} == _entry_ra) return;\n"
++                    "    JUMP_INDIRECT_RESUME_AT(ctx, {}, 0x{:08X}u);\n",
++                    reg(rs), reg(rs), site);
+     for (uint32_t target : raResume) {
+       code += fmt::format("    if (ctx->r31 == 0x{:08X}u) goto {};\n", target,
+                           label(target));
+@@ -694,13 +724,17 @@ std::string InstructionEmitter::emitFunction(const RecompFunction &func) const {
+       // We inject a yield point so the game thread can process pending
+       // hardware callbacks (CD-ROM sector delivery, VBlank events, etc).
+       // Without this, any recompiled polling loop would spin forever.
++      // A loop closed by an unconditional `j` back to its top is the same
++      // busy-wait: without a yield there the emulated clock and drive never
++      // advance, so the condition it waits for can never come true
++      // (Apocalypse's FMV player waits for the next frame exactly this way).
+       std::string yieldCode;
+-      if (inst.isBranch()) {
+-        uint32_t brTarget = inst.branchTarget(addr);
+-        if (brTarget <= addr) {
+-          yieldCode =
+-              "    if (ctx->bios) ctx->bios->drainPendingCallbacks();\n";
+-        }
++      const bool backwardBranch =
++          inst.isBranch() && inst.branchTarget(addr) <= addr;
++      const bool backwardJump =
++          inst.id == InstrId::J && inst.jumpTarget(addr) <= addr;
++      if (backwardBranch || backwardJump) {
++        yieldCode = "    if (ctx->bios) ctx->bios->drainPendingCallbacks();\n";
+       }
+ 
+       if (!conflictRegs.empty()) {
+@@ -770,6 +804,18 @@ std::string InstructionEmitter::emitFunction(const RecompFunction &func) const {
+     }
+   }
+ 
++  // Fall-through past the last instruction continues at the next address, as
++  // it does on hardware.  The analyzer splits a function wherever something
++  // calls into its middle -- Apocalypse's 0x8007D5A4 became an 8-byte
++  // "function" (the prologue: sp -= 64, save ra) because a bogus call target
++  // decoded from data pointed 8 bytes in.  Without this the C++ function just
++  // returned there, leaving $sp 64 bytes low; every caller then restored its
++  // saved registers from the wrong slots and game objects became garbage.
++  // Before this, control fell into the first OOB label below instead.
++  result += fmt::format(
++      "    recomp_dispatch(rdram, ctx, 0x{:08X}); return; // fall-through\n",
++      func.address + static_cast<uint32_t>(numInstr * 4));
++
+   // Emit OOB target labels
+   // Always use recomp_dispatch for OOB -- we can't trust that
+   // the target corresponds to a known function.
+diff --git a/ps1Recomp/src/main.cpp b/ps1Recomp/src/main.cpp
+index fae6690..38c3b09 100644
+--- a/ps1Recomp/src/main.cpp
++++ b/ps1Recomp/src/main.cpp
+@@ -43,9 +43,28 @@ using namespace ps1recomp;
+ //
+ // Returns a vector of target addresses (empty if pattern not found).
+ 
++// True when `w` may write general register `reg` (conservative: an
++// instruction whose destination field names `reg` counts even if it writes
++// nothing, which only makes the caller give up).
++static bool mayWriteReg(uint32_t w, uint8_t reg) {
++  const uint32_t op = w >> 26, rs = (w >> 21) & 31, rt = (w >> 16) & 31,
++                 rd = (w >> 11) & 31;
++  if (op == 0)
++    return rd == reg;
++  if (op == 3)
++    return reg == 31; // JAL
++  if (op == 1)
++    return reg == 31 && (rt & 0x10); // BLTZAL/BGEZAL
++  if ((op >= 0x08 && op <= 0x0F) || (op >= 0x20 && op <= 0x26))
++    return rt == reg; // ALU immediate, loads
++  if ((op == 0x10 || op == 0x12) && (rs == 0 || rs == 2))
++    return rt == reg; // MFC0/CFC0, MFC2/CFC2
++  return false;
++}
++
+ static std::vector<uint32_t>
+ detectJumpTable(const std::vector<uint32_t> &instrs, size_t jr_idx,
+-                const ElfParser &parser) {
++                const ElfParser &parser, uint32_t funcAddr) {
+   if (jr_idx == 0)
+     return {};
+ 
+@@ -89,28 +108,56 @@ detectJumpTable(const std::vector<uint32_t> &instrs, size_t jr_idx,
+   // one is the scaled index.
+   uint32_t lui_val = 0;
+   int16_t addiu_imm = 0;
+-  auto traceToLui = [&](uint8_t reg) {
++  // Trace `reg` back from the ADDU to the LUI that forms the base, through
++  // an optional ADDIU -- which may come from another register
++  // (`lui $v0,hi; addiu $s2,$v0,lo`).  Any other write to the traced
++  // register means it is not a constant (e.g. it is the scaled index).
++  auto traceBase = [&](uint8_t reg, int limit) {
+     lui_val = 0;
+     addiu_imm = 0;
+-    for (int j = lw_idx - 1; j >= 0 && j >= (int)jr_idx - 20; j--) {
++    bool sawAddiu = false;
++    for (int j = addu_idx - 1; j >= 0 && j >= limit; j--) {
+       Instruction inst = MipsDecoder::decode(instrs[j]);
+       if (inst.id == InstrId::LUI && inst.rt == reg) {
+         lui_val = static_cast<uint32_t>(static_cast<uint16_t>(inst.imm16)) << 16;
+         return true;
+       }
+-      if ((inst.id == InstrId::ADDIU || inst.id == InstrId::ADDI) &&
+-          inst.rt == reg && inst.rs == reg) {
++      if (!sawAddiu && (inst.id == InstrId::ADDIU || inst.id == InstrId::ADDI) &&
++          inst.rt == reg) {
+         addiu_imm = inst.imm16;
++        sawAddiu = true;
++        reg = inst.rs;
++        continue;
+       }
++      if (mayWriteReg(instrs[j], reg))
++        return false;
+     }
+     return false;
+   };
++  auto traceToLui = [&](uint8_t reg) {
++    return traceBase(reg, static_cast<int>(jr_idx) - 20);
++  };
++
++  // Compilers also hoist the table base into a callee-saved register at the
++  // top of the function (Apocalypse 0x80047F28 keeps it in $s2), far outside
++  // the window above.  Walk back through the whole function for the LUI,
++  // stopping at any other write to the register.  Such a table is accepted
++  // only if every entry lands inside this function.
++  bool longTrace = false;
++  auto traceToLuiLong = [&](uint8_t reg) { return traceBase(reg, 0); };
+ 
+   uint8_t scaled_reg = addu_rt;
+   if (!traceToLui(addu_rs)) {
+     scaled_reg = addu_rs;
+-    if (!traceToLui(addu_rt))
+-      return {};
++    if (!traceToLui(addu_rt)) {
++      longTrace = true;
++      scaled_reg = addu_rt;
++      if (!traceToLuiLong(addu_rs)) {
++        scaled_reg = addu_rs;
++        if (!traceToLuiLong(addu_rt))
++          return {};
++      }
++    }
+   }
+ 
+   uint32_t table_addr = lui_val + static_cast<uint32_t>(addiu_imm) +
+@@ -161,6 +208,14 @@ detectJumpTable(const std::vector<uint32_t> &instrs, size_t jr_idx,
+       break;
+     targets.push_back(entry);
+   }
++  if (longTrace) {
++    const uint32_t funcEnd = funcAddr + static_cast<uint32_t>(instrs.size()) * 4;
++    if (targets.empty())
++      return {};
++    for (uint32_t t : targets)
++      if (t < funcAddr || t >= funcEnd || (t & 3))
++        return {};
++  }
+   return targets;
+ }
+ 
+@@ -189,6 +244,44 @@ int main(int argc, char *argv[]) {
+       return 1;
+     }
+ 
++    // Instruction patches: [[patches]] address = "0x...", value = "0x...",
++    // expect = "0x..." (the original word, checked so a patch cannot land on
++    // a different build).  For per-game fixes that only make sense in the
++    // recompiled world -- e.g. busy-wait timeouts counted in CPU iterations,
++    // which native code exhausts hundreds of times faster than an R3000A.
++    if (config.contains("patches")) {
++      const auto &arr = toml::find<std::vector<toml::value>>(config, "patches");
++      for (const auto &p : arr) {
++        const uint32_t addr =
++            std::stoul(toml::find<std::string>(p, "address"), nullptr, 16);
++        const uint32_t value =
++            std::stoul(toml::find<std::string>(p, "value"), nullptr, 16);
++        const auto *sec = parser.findSectionByAddress(addr);
++        if (!sec || !sec->data || addr + 4 > sec->vaddr + sec->size) {
++          fmt::print(stderr, "patch 0x{:08X}: not in a loaded section\n", addr);
++          return 1;
++        }
++        auto *word = const_cast<uint8_t *>(sec->data) + (addr - sec->vaddr);
++        const uint32_t old = word[0] | (word[1] << 8) | (word[2] << 16) |
++                             (static_cast<uint32_t>(word[3]) << 24);
++        if (p.contains("expect")) {
++          const uint32_t expect =
++              std::stoul(toml::find<std::string>(p, "expect"), nullptr, 16);
++          if (old != expect) {
++            fmt::print(stderr,
++                       "patch 0x{:08X}: found 0x{:08X}, expected 0x{:08X}\n",
++                       addr, old, expect);
++            return 1;
++          }
++        }
++        word[0] = value & 0xFF;
++        word[1] = (value >> 8) & 0xFF;
++        word[2] = (value >> 16) & 0xFF;
++        word[3] = value >> 24;
++      }
++      fmt::print("Patches applied: {}\n", arr.size());
++    }
++
+     // HLE overrides: replace a function body with a named HLE stub
+     // Config section: [hle_overrides]
+     //   "0x801AA484" = "hle_DrawSync"   (calls ps1::psyq::hle_DrawSync)
+@@ -270,6 +363,9 @@ int main(int argc, char *argv[]) {
+           c = '_';
+       uint32_t addr =
+           std::stoul(toml::find<std::string>(func, "address"), nullptr, 16);
++      // A region entry is known by its entry point, not the region start.
++      if (func.contains("entry"))
++        addr = std::stoul(toml::find<std::string>(func, "entry"), nullptr, 16);
+       known_funcs.push_back(addr);
+       addr_to_name[addr] = name;
+       result_cpp +=
+@@ -375,6 +471,16 @@ int main(int argc, char *argv[]) {
+       rfunc.size = size;
+       rfunc.instructions.resize(num_instrs);
+       rfunc.isLabelTarget.resize(num_instrs, false);
++      if (func.contains("entry")) {
++        rfunc.entry =
++            std::stoul(toml::find<std::string>(func, "entry"), nullptr, 16);
++        if (rfunc.entry < addr || rfunc.entry >= addr + size) {
++          fmt::print(stderr, "{}: entry 0x{:08X} outside 0x{:08X}+{}\n", name,
++                     rfunc.entry, addr, size);
++          return 1;
++        }
++        rfunc.isLabelTarget[(rfunc.entry - addr) / 4] = true;
++      }
+ 
+       for (uint32_t i = 0; i < num_instrs; ++i) {
+         const uint8_t *ptr = section->data + offset + (i * 4);
+@@ -419,7 +525,7 @@ int main(int argc, char *argv[]) {
+           // Jump table auto-detection
+           // Try to detect the LUI+ADDIU+ADDU+LW+JR pattern and resolve
+           // the table entries from the ELF binary.
+-          auto targets = detectJumpTable(rfunc.instructions, i, parser);
++          auto targets = detectJumpTable(rfunc.instructions, i, parser, addr);
+           const char *how = "table entries detected";
+           if (targets.empty()) {
+             // No table in memory: the target may be computed from a code
+diff --git a/ps1Test/recompiler/test_forward_branch.cpp b/ps1Test/recompiler/test_forward_branch.cpp
+index 23d545b..97f0491 100644
+--- a/ps1Test/recompiler/test_forward_branch.cpp
++++ b/ps1Test/recompiler/test_forward_branch.cpp
+@@ -82,7 +82,7 @@ TEST(EmitterDirectCall, JalWritesReturnAddressBeforeCalling) {
+   const std::string out = em.emitFunction(f);
+ 
+   const size_t ra = out.find("ctx->r31 = 0x80010008");
+-  const size_t call = out.find("func_80020000(rdram, ctx);");
++  const size_t call = out.find("func_80020000(rdram, ctx)");
+   ASSERT_NE(call, std::string::npos) << out;
+   ASSERT_NE(ra, std::string::npos)
+       << "jal deve gravar $ra = PC+8 antes de chamar\n" << out;
+diff --git a/ps1Test/recompiler/test_instruction_emitter.cpp b/ps1Test/recompiler/test_instruction_emitter.cpp
+index e4f6e64..ce6ce0e 100644
+--- a/ps1Test/recompiler/test_instruction_emitter.cpp
++++ b/ps1Test/recompiler/test_instruction_emitter.cpp
+@@ -322,13 +322,14 @@ TEST(InstructionEmitter, GTE_RegisterMoves) {
+   // MFC2 $v0, r5
+   auto code = emitter.emitInstruction(
+       MipsDecoder::decode(encR(0x12, 0x00, 2, 5, 0, 0)), 0);
+-  EXPECT_NE(code.find("cop2d"), std::string::npos);
++  // Through the accessor, which applies the hardware read behaviour
++  EXPECT_NE(code.find("gte_read_data(ctx, 5)"), std::string::npos);
+   EXPECT_NE(code.find("ctx->r2"), std::string::npos);
+ 
+   // MTC2 $v0, r5
+   code = emitter.emitInstruction(
+       MipsDecoder::decode(encR(0x12, 0x04, 2, 5, 0, 0)), 0);
+-  EXPECT_NE(code.find("cop2d"), std::string::npos);
++  EXPECT_NE(code.find("gte_write_data(ctx, 5,"), std::string::npos);
+ }
+ 
+ TEST(InstructionEmitter, GTE_Commands) {
