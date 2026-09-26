@@ -19,7 +19,8 @@ in-game menu on top.
 · [release notes](https://github.com/RFarrow9/ApocalypseRecomp/releases/latest)
 
 Unzip it, run `Apocalypse.exe`, and point it at your own disc image (`.cue`) the first time.
-Press **F1** in game for the menu.
+Nothing else needs installing. Windows may warn *"Windows protected your PC"* because the
+exe isn't code-signed: click **More info → Run anyway**. Press **F1** in game for the menu.
 
 ## What this repo is (and is not)
 
@@ -104,7 +105,7 @@ by reading the pickup handler; the comments in `overrides.toml` record how.
     git clone --recurse-submodules https://github.com/PS1Recomp/ps1-recomp.git ../PS1Recomp-ps1-recomp
     cd ../PS1Recomp-ps1-recomp && git checkout ab4f0e0
     for p in 002 003 004 005 006; do git apply ../ApocalypseRecomp/patches/$p-*.patch; done
-    cmake -B build -DPS1RECOMP_BUILD_TESTS=OFF -DSDL2_DIR=<path to SDL2-2.32.10>/cmake
+    cmake -B build -DPS1RECOMP_BUILD_TESTS=OFF -DSDL2_DIR=<path to SDL2-2.32.10>/cmake \n        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded   # static CRT: the exe runs without the VC++ redist
     cmake --build build --config Release --target ps1Analyzer ps1Recomp
 
     # every change: analyze -> merge overrides -> recompile -> build
