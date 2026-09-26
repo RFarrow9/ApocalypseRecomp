@@ -105,7 +105,9 @@ by reading the pickup handler; the comments in `overrides.toml` record how.
     git clone --recurse-submodules https://github.com/PS1Recomp/ps1-recomp.git ../PS1Recomp-ps1-recomp
     cd ../PS1Recomp-ps1-recomp && git checkout ab4f0e0
     for p in 002 003 004 005 006; do git apply ../ApocalypseRecomp/patches/$p-*.patch; done
-    cmake -B build -DPS1RECOMP_BUILD_TESTS=OFF -DSDL2_DIR=<path to SDL2-2.32.10>/cmake \n        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded   # static CRT: the exe runs without the VC++ redist
+    # MultiThreaded = static C runtime, so the exe runs without the VC++ redistributable
+    cmake -B build -DPS1RECOMP_BUILD_TESTS=OFF -DSDL2_DIR=<path to SDL2-2.32.10>/cmake \
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
     cmake --build build --config Release --target ps1Analyzer ps1Recomp
 
     # every change: analyze -> merge overrides -> recompile -> build
