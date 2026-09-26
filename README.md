@@ -1,5 +1,11 @@
 # Apocalypse: Recompiled
 
+> ### ⬇️ Just want to play? **[Download for Windows](https://github.com/RFarrow9/ApocalypseRecomp/releases/latest/download/Apocalypse-Recompiled-win64.zip)**
+> Unzip, run `Apocalypse.exe`, pick your own disc image (`.cue`). Nothing else to install.
+> Windows may say *"Windows protected your PC"* (the exe isn't code-signed): click
+> **More info → Run anyway**. Press **F1** in game for the menu.
+> · [Release notes](https://github.com/RFarrow9/ApocalypseRecomp/releases/latest)
+
 A native PC version of **Apocalypse** (PlayStation, 1998, Neversoft/Activision), made by
 statically recompiling the game's code to x86-64 with
 [PS1Recomp](https://github.com/PS1Recomp/ps1-recomp). It is not an emulator: the game's
@@ -12,15 +18,6 @@ in-game menu on top.
 > **Unofficial fan project.** Not affiliated with or endorsed by Activision or Neversoft.
 > **No game data is included:** you need your own copy of the PAL disc (SLES-00460) as a
 > BIN/CUE image.
-
-## ⬇️ Download
-
-**[Download Apocalypse: Recompiled for Windows (zip)](https://github.com/RFarrow9/ApocalypseRecomp/releases/latest/download/Apocalypse-Recompiled-win64.zip)**
-· [release notes](https://github.com/RFarrow9/ApocalypseRecomp/releases/latest)
-
-Unzip it, run `Apocalypse.exe`, and point it at your own disc image (`.cue`) the first time.
-Nothing else needs installing. Windows may warn *"Windows protected your PC"* because the
-exe isn't code-signed: click **More info → Run anyway**. Press **F1** in game for the menu.
 
 ## What this repo is (and is not)
 
