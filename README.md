@@ -13,8 +13,13 @@ in-game menu on top.
 > **No game data is included:** you need your own copy of the PAL disc (SLES-00460) as a
 > BIN/CUE image.
 
-**To play:** download the zip from [Releases](../../releases), run `Apocalypse.exe`, and
-point it at your disc image the first time.
+## ⬇️ Download
+
+**[Download Apocalypse: Recompiled for Windows (zip)](https://github.com/RFarrow9/ApocalypseRecomp/releases/latest/download/Apocalypse-Recompiled-win64.zip)**
+· [release notes](https://github.com/RFarrow9/ApocalypseRecomp/releases/latest)
+
+Unzip it, run `Apocalypse.exe`, and point it at your own disc image (`.cue`) the first time.
+Press **F1** in game for the menu.
 
 ## What this repo is (and is not)
 
